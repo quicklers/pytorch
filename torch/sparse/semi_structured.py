@@ -4,9 +4,13 @@ from typing import Any, Optional
 
 import torch
 
+from torch.sparse._semi_structured_conversions import (
+    sparse_semi_structured_from_dense,
+    sparse_semi_structured_to_dense,
+)
+
 
 __all__ = [
-    "to_sparse_semi_structured",
     "SparseSemiStructuredTensor",
 ]
 
@@ -16,9 +20,11 @@ _SEMI_STRUCTURED_SPARSE_CONFIG = namedtuple(
 _DTYPE_TO_SEMI_STRUCTURED_SPARSE_CONFIG = {
     torch.float16: _SEMI_STRUCTURED_SPARSE_CONFIG(9, 64),
     torch.int8: _SEMI_STRUCTURED_SPARSE_CONFIG(10, 128),
+    # FIXME: suport for torch.bfloat should be enabled here.
 }
 
 _WARNING_SHOWN = False
+
 
 class SparseSemiStructuredTensor(torch.Tensor):
     """This class implementes semi-structured sparsity as a Tensor subclass.
@@ -29,12 +35,12 @@ class SparseSemiStructuredTensor(torch.Tensor):
 
     Currently, this class supports 2:4 sparsity for int8 and float16 dtypes.
 
-    This subclass stores the dense tensor in a compressed form by only storing the specified elemenets and a metadata mask.
+    This subclass stores the dense tensor in a compressed form by only storing the specified elements and corresponding metadata.
     These two are stored next to each other in one contiguous tensor.
 
     We choose to store the specified elements and the metadata in a single tensor for future compatibilty with cuSPARSELt.
 
-    compressed tensor = [ specified elements of original tensor |   mask_metadata     ]
+    compressed tensor = [ specified elements of original tensor |   metadata     ]
 
     For an original tensor of size (m, k) we expect the first m * k // 2 elements to be the kept elements
     The rest of the tensor is metadata.
@@ -48,7 +54,6 @@ class SparseSemiStructuredTensor(torch.Tensor):
         cls,
         original_tensor: Optional[torch.Tensor],
         original_shape: Optional[torch.Size] = None,
-        mask: Optional[torch.Tensor] = None,
         compressed_tensor: Optional[torch.Tensor] = None,
         transposed: bool = False,
     ):
@@ -61,8 +66,7 @@ class SparseSemiStructuredTensor(torch.Tensor):
         Args:
             original_tensor: The original dense tensor, or None, if we have already compressed the tensor.
             original_shape: The shape of the original dense tensor
-            mask: Mask to be applied to the original tensor.
-            compressed_tensor: A flattened tensor to store the specified elements and mask metadata.
+            compressed_tensor: A flattened tensor to store the specified elements and metadata.
             transposed: Whether the tensor is transposed or not.
 
         Returns:
@@ -92,7 +96,6 @@ class SparseSemiStructuredTensor(torch.Tensor):
         self,
         original_tensor: Optional[torch.Tensor],
         original_shape: Optional[torch.Size] = None,
-        mask: Optional[torch.Tensor] = None,
         compressed_tensor: Optional[torch.Tensor] = None,
         transposed: bool = False,
     ) -> None:
@@ -101,15 +104,13 @@ class SparseSemiStructuredTensor(torch.Tensor):
         Args:
             original_tensor: The original dense tensor, or None, if we have already compressed the tensor.
             original_shape: The shape of the original dense tensor
-            mask: Mask to be applied to the original tensor.
-            compressed_tensor: A flattened tensor to store the specified elements and mask metadata.
+            compressed_tensor: A flattened tensor to store the specified elements and metadata.
             transposed: Whether the tensor is transposed or not.
 
         Returns:
             None
 
         Raises:
-            NotImplementedError: If ``mask=None``, as we currently do not support inferring a mask from the dense tensor.
             RuntimeError: If original_tensor is not a supported dtype, dim, shape, or device.
         """
         global _WARNING_SHOWN
@@ -127,10 +128,6 @@ class SparseSemiStructuredTensor(torch.Tensor):
 
         # if original tensor is passed in, we need to compress it and store the compressed representation.
         if original_tensor is not None:
-            # check if mask passed in
-            if mask is None:
-                raise NotImplementedError("You must pass in a mask to to_sparse_semi_structured, currently mask=None.")
-
             # check device
             if not original_tensor.is_cuda:
                 raise RuntimeError(
@@ -185,16 +182,8 @@ class SparseSemiStructuredTensor(torch.Tensor):
                 device=original_tensor.device,
             )
 
-            # TODO This is a temporoary hack to get the mask in compressed form so we can store the compressed tensor.
-            # In the future, we will add in a conversion function from the mask to the meta that we can use instead.
-            placeholder = torch.ones(
-                (128, n), dtype=original_tensor.dtype, device=original_tensor.device
-            )
-            specified = original_tensor.masked_select(mask).view(m, n // 2)
-            _, meta = torch._structured_sparse_linear(placeholder, specified, mask)
-            # set the specified elements
-            compressed_tensor[: m * n // 2] = specified.view(-1)
-            # set the metadata
+            sparse, meta = sparse_semi_structured_from_dense(original_tensor)
+            compressed_tensor[: m * n // 2] = sparse.view(-1)
             compressed_tensor[m * n // 2 :] = meta.view(original_tensor.dtype).view(-1)
 
         # set values
@@ -244,7 +233,6 @@ class SparseSemiStructuredTensor(torch.Tensor):
             return SparseSemiStructuredTensor(
                 args[0].original_tensor,
                 original_shape=args[0].shape,
-                mask=None,
                 compressed_tensor=args[0].compressed_tensor,
                 transposed=args[0].transposed,
             )
@@ -256,7 +244,6 @@ class SparseSemiStructuredTensor(torch.Tensor):
             return SparseSemiStructuredTensor(
                 args[0].original_tensor,
                 original_shape=args[0].shape,
-                mask=None,
                 compressed_tensor=args[0].compressed_tensor,
                 transposed=not args[0].transposed,
             )
@@ -331,59 +318,7 @@ class SparseSemiStructuredTensor(torch.Tensor):
         )
         raise NotImplementedError(error_string)
 
-
-def to_sparse_semi_structured(
-    original_tensor: torch.Tensor,
-    mask: Optional[torch.Tensor] = None,
-    transposed: bool = False,
-) -> SparseSemiStructuredTensor:
-    """
-    This function converts a dense tensor into a sparse semi-structured tensor.
-    It will return a SparseSemiStructuredTensor, a subclass of torch.Tensor.
-
-    This function will check to ensure the dense tensor has the right dtype, size, dims, and device.
-    We currently only support semi-structured sparse tensors for 2d CUDA tensors.
-    Additionally, your tensor must be a positive multiple of a block size given the dtype
-
-    - torch.float16  (r, c) must be >= and a multiple of 64
-    - torch.int8     (r, c) must be >= and a multiple of 128
-
-    Args:
-        original_tensor (Tensor): the dense tensor to convert
-        mask (Optional BoolTensor): boolean mask to apply to the original tensor
-        transposed (bool, optional): whether the dense tensor is transposed
-
-    Returns:
-        SparseSemiStructuredTensor: A sparse semi-structured tensor created from the given original_tensor and mask
-
-    Raises:
-        None
-
-    Example:
-        >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_CUDA)
-        >>> A = torch.Tensor([0, 0, 1, 1]).tile((128, 32)).half().cuda()
-        tensor([[0., 0., 1.,  ..., 0., 1., 1.],
-                [0., 0., 1.,  ..., 0., 1., 1.],
-                [0., 0., 1.,  ..., 0., 1., 1.],
-                ...,
-                [0., 0., 1.,  ..., 0., 1., 1.],
-                [0., 0., 1.,  ..., 0., 1., 1.],
-                [0., 0., 1.,  ..., 0., 1., 1.]], device='cuda:0', dtype=torch.float16)
-        >>> A_sparse = to_sparse_semi_structured(A, mask=A.bool())
-        SparseSemiStructuredTensor(shape=torch.Size([128, 128]), transposed=False, values=tensor([[1., 1., 1.,  ..., 1., 1., 1.],
-                [1., 1., 1.,  ..., 1., 1., 1.],
-                [1., 1., 1.,  ..., 1., 1., 1.],
-                ...,
-                [1., 1., 1.,  ..., 1., 1., 1.],
-                [1., 1., 1.,  ..., 1., 1., 1.],
-                [1., 1., 1.,  ..., 1., 1., 1.]], device='cuda:0', dtype=torch.float16),
-            metadata=tensor([[-4370, -4370, -4370,  ..., -4370, -4370, -4370],
-                [-4370, -4370, -4370,  ..., -4370, -4370, -4370],
-                [-4370, -4370, -4370,  ..., -4370, -4370, -4370],
-                ...,
-                [-4370, -4370, -4370,  ..., -4370, -4370, -4370],
-                [-4370, -4370, -4370,  ..., -4370, -4370, -4370],
-                [-4370, -4370, -4370,  ..., -4370, -4370, -4370]], device='cuda:0',
-       dtype=torch.int16))
-    """
-    return SparseSemiStructuredTensor(original_tensor, mask=mask, transposed=transposed)
+    def to_dense(self):
+        sparse = self.values()
+        meta = self.indices()
+        return sparse_semi_structured_to_dense(sparse, meta)
